@@ -4,6 +4,16 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Live Match Tracker</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
+
+<!-- Sportradar LMT layout stylesheets, vendored locally (see vendor/README.md) -->
+<link rel="stylesheet" href="./vendor/sr-layout.css">
+<!-- Your colour tokens. Unchanged. -->
+<link rel="stylesheet" href="./theme.css">
+
 <style>
   body {
     margin: 0; padding: 20px; display: flex; justify-content: center;
@@ -12,49 +22,13 @@
   }
   .sr-widget { width: 100vw; max-width: 800px; }
 </style>
-<link rel="stylesheet" href="./theme.css">
 </head>
 <body>
 
 <div class="sr-widget"></div>
 
-<script>
-// ─────────────────────────────────────────────────────────────
-// REPLACE with YOUR OWN Sportradar client key.
-// Do not reuse DraftKings' key — that is their paid subscription.
-// Get one at: https://sportradar.com  (ask for "SIR widgets / LMT Plus")
-// ─────────────────────────────────────────────────────────────
-const SR_CLIENT_KEY = "0b9c8c7d49a58a644db78b76b453a593";
-
-// Sportradar match ID. Portable across subscriptions.
-const MATCH_ID = "63303355";
-
-// Standard Sportradar widget loader
-(function (a, b, c, d, e, f, g, h, i) {
-  a[e] || (i = a[e] = function () { (a[e].q = a[e].q || []).push(arguments) },
-  i.l = 1 * new Date, i.o = f,
-  g = b.createElement(c), h = b.getElementsByTagName(c)[0],
-  g.async = 1, g.src = d, g.setAttribute("n", e),
-  h.parentNode.insertBefore(g, h));
-})(window, document, "script",
-   "https://widgets.sir.sportradar.com/" + SR_CLIENT_KEY + "/widgetloader",
-   // theme:false = "I supply my own theme" -> theme.css
-   "SIR", { theme: false, language: "en" });
-
-SIR("addWidget", ".sr-widget", "match.lmtPlus", {
-  // Real value from the source page. Colors come from theme.css, not
-  // from here — this only mattered earlier because no theme was loaded.
-  customBrandColor: "#000000",
-  adsFrequency: false,
-  layout: "double",
-  scoreboard: "disable",
-  detailedScoreboard: "disable",
-  momentum: "disable",
-  tabsPosition: "top",
-  language: "en",
-  matchId: MATCH_ID,
-});
-</script>
+<script src="./vendor/sr-pitch.js"></script>
+<script src="./app.js"></script>
 
 </body>
 </html>
