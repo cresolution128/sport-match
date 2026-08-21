@@ -31,25 +31,134 @@ async function getJSON(url) {
   return r.json();
 }
 
-async function loadAll(gamePk) {
-  const feed = await getJSON(`${API}/v1.1/game/${gamePk}/feed/live`);
-  const g = feed.gameData;
-  const season = g.game.season;
-  const homeId = g.teams.home.id, awayId = g.teams.away.id;
-
-  const [h2h, standings, teams] = await Promise.all([
-    getJSON(`${API}/v1/schedule?sportId=1&teamId=${awayId}&opponentId=${homeId}&season=${season}&gameType=R`)
-      .catch(() => ({ dates: [] })),
-    getJSON(`${API}/v1/standings?leagueId=103,104&season=${season}&standingsTypes=regularSeason`)
-      .catch(() => ({ records: [] })),
-    /* standings rows carry only team ids, so we need the directory for
-       abbreviations and full names */
-    getJSON(`${API}/v1/teams?sportId=1&season=${season}`).catch(() => ({ teams: [] })),
-  ]);
-  const teamById = {};
-  for (const t of (teams.teams || [])) teamById[t.id] = t;
-  return { feed, h2h, standings, teamById };
+async function seasonHitting(teamId, season) {
+  try {
+    const d = await getJSON(`${API}/v1/teams/${teamId}/stats?stats=season&group=hitting&season=${season}&sportId=1`);
+    return ((((d.stats || [])[0] || {}).splits || [])[0] || {}).stat || {};
+  } catch (e) { return {}; }
 }
+
+/* Team leaders. "strikeouts" exists in several stat groups, so we ask for the
+   group explicitly and keep the matching one. */
+async function teamLeaders(teamId, season, cats, group) {
+  try {
+    const g = group ? `&group=${group}` : "";
+    const d = await getJSON(`${API}/v1/teams/${teamId}/leaders?leaderCategories=${cats}&season=${season}&leaderGameTypes=R&limit=5${g}`);
+    const out = {};
+    for (const L of (d.teamLeaders || [])) {
+      if (group && L.statGroup !== group) continue;
+      out[L.leaderCategory] = L.leaders || [];
+    }
+    return out;
+  } catch (e) { return {}; }
+}
+
+/* Last ten completed games, newest first, as W/L letters. */
+async function recentForm(teamId, season) {
+  try {
+    const d = await getJSON(`${API}/v1/schedule?sportId=1&teamId=${teamId}&season=${season}&gameType=R`);
+    const games = [];
+    for (const day of (d.dates || [])) for (const g of day.games) {
+      if (g.status.abstractGameState !== "Final") continue;
+      const home = g.teams.home.team.id === teamId;
+      const us = home ? g.teams.home.score : g.teams.away.score;
+      const them = home ? g.teams.away.score : g.teams.home.score;
+      games.push({ date: day.date, res: us > them ? "W" : us < them ? "L" : "D" });
+    }
+    games.sort((a, b) => (a.date < b.date ? 1 : -1));
+    return games.slice(0, 10).map((g) => g.res);
+  } catch (e) { return []; }
+}
+
+/* The widget paints from the match feed alone, then fetches each tab's extra
+   data when you open that tab. We do the same: loading everything up front
+   cost ~13 requests before first paint and left tab switches with nothing to
+   wait for (which is why they used to feel different from the real widget). */
+async function loadFeed(gamePk) {
+  const feed = await getJSON(`${API}/v1.1/game/${gamePk}/feed/live`);
+  /* MLB answers 200 with a stub (gamePk 0, no teams) for ids it does not know,
+     so an unknown id has to be detected from the payload, not the status. */
+  if (!feed || !feed.gameData || !feed.gameData.teams || !feed.gameData.teams.away) {
+    throw new Error(`No MLB game with id ${gamePk}`);
+  }
+  return { feed };
+}
+
+/* Per-tab data, fetched once and cached on the data object. Tabs not listed
+   here (box score, timeline) render straight from the feed. */
+const TAB_DATA = {
+  statistics: {
+    key: "season",
+    async load(feed) {
+      const season = feed.gameData.game.season;
+      const [away, home] = await Promise.all([
+        seasonHitting(feed.gameData.teams.away.id, season),
+        seasonHitting(feed.gameData.teams.home.id, season),
+      ]);
+      return { season: { away, home } };
+    },
+  },
+
+  headToHead: {
+    key: "leaders",
+    async load(feed) {
+      const season = feed.gameData.game.season;
+      const awayId = feed.gameData.teams.away.id, homeId = feed.gameData.teams.home.id;
+      const [standings, awayHit, homeHit, awayPit, homePit, awayForm, homeForm] = await Promise.all([
+        getJSON(`${API}/v1/standings?leagueId=103,104&season=${season}&standingsTypes=regularSeason`)
+          .catch(() => ({ records: [] })),
+        teamLeaders(awayId, season, "homeRuns,battingAverage,runsBattedIn", "hitting"),
+        teamLeaders(homeId, season, "homeRuns,battingAverage,runsBattedIn", "hitting"),
+        teamLeaders(awayId, season, "earnedRunAverage,wins,strikeouts", "pitching"),
+        teamLeaders(homeId, season, "earnedRunAverage,wins,strikeouts", "pitching"),
+        recentForm(awayId, season),
+        recentForm(homeId, season),
+      ]);
+      return {
+        standings,
+        leaders: { away: { ...awayHit, ...awayPit }, home: { ...homeHit, ...homePit } },
+        form: { away: awayForm, home: homeForm },
+      };
+    },
+  },
+
+  standings: {
+    key: "byLeague",
+    async load(feed) {
+      const season = feed.gameData.game.season;
+      const [standings, byLeague, teams] = await Promise.all([
+        getJSON(`${API}/v1/standings?leagueId=103,104&season=${season}&standingsTypes=regularSeason`)
+          .catch(() => ({ records: [] })),
+        getJSON(`${API}/v1/standings?leagueId=103,104&season=${season}&standingsTypes=byLeague`)
+          .catch(() => ({ records: [] })),
+        /* standings rows carry only team ids, so we need the directory for
+           abbreviations and full names */
+        getJSON(`${API}/v1/teams?sportId=1&season=${season}`).catch(() => ({ teams: [] })),
+      ]);
+      const teamById = {};
+      for (const t of (teams.teams || [])) teamById[t.id] = t;
+      return { standings, byLeague, teamById };
+    },
+  },
+};
+
+/* Resolves a tab's data, at most once per tab. */
+function ensureTabData(data, tab) {
+  const spec = TAB_DATA[tab];
+  if (!spec || data[spec.key]) return null;
+  if (!data._pending) data._pending = {};
+  if (!data._pending[tab]) {
+    data._pending[tab] = spec.load(data.feed)
+      .then((extra) => { Object.assign(data, extra); })
+      .catch(() => { data[spec.key] = data[spec.key] || {}; });
+  }
+  return data._pending[tab];
+}
+
+const tabReady = (data, tab) => {
+  const spec = TAB_DATA[tab];
+  return !spec || Boolean(data[spec.key]);
+};
 
 /* ---------- responsive classes ----------
    The widget re-implements CSS container queries in JS: each component carries
@@ -97,11 +206,30 @@ function responsive(node, key) {
 }
 
 /* The widget wraps every panel in a loader container. */
+/* The widget's three-dot spinner. Colour comes from the theme token. */
+function loaderOverlay() {
+  const dots = el("div", "sr-loader-dots srt-base-1-primary");
+  for (let i = 0; i < 3; i++) dots.appendChild(el("div", "sr-loader-dots__dot"));
+  return el("div", "sr-loader__overlay", dots);
+}
+
 function panelShell(componentClass, key, ...kids) {
   const root = el("div", `sr-bb ${componentClass} sr-ltr`);
   if (key) responsive(root, key);
-  root.appendChild(el("div", "sr-loader__container",
-    el("div", "sr-loader__overlay"), ...kids));
+  root.appendChild(el("div", "sr-loader__container", loaderOverlay(), ...kids));
+  return root;
+}
+
+/* An empty panel showing only the spinner, while a tab's data is in flight.
+   srm-loading is the widget's own hook: it reveals the overlay and blurs
+   whatever is behind it. */
+function loadingPanel(title) {
+  const root = el("div", "sr-bb sr-lmt-plus-3-statistics sr-ltr");
+  const container = el("div", "sr-loader__container srm-loading",
+    loaderOverlay(),
+    el("div", "sr-lmt-plus-3-statistics__container srt-base-1",
+      el("div", "sr-lmt-plus-slider__wrapper", sliderTitle(title, 0, 1))));
+  root.appendChild(container);
   return root;
 }
 
@@ -171,10 +299,61 @@ function renderTabs(active, onSelect) {
           el("div", "sr-tabs__scrollable", flex)))));
 }
 
+/* Paging behaviour for the widget's flex sliders: auto-advance plus pointer
+   drag. The widget does both; without it the venue box is a dead panel. */
+function attachSlider(track, slides, autoMs) {
+  if (slides.length < 2) return;
+  let idx = 0, timer = 0, dragging = false, startX = 0, dx = 0;
+
+  const place = (offsetPx) => {
+    const w = track.getBoundingClientRect().width || 1;
+    const pct = (-idx * 100) + (offsetPx / w) * 100;
+    for (const n of slides) {
+      n.style.transition = dragging ? "none" : "transform .45s";
+      n.style.transform = `translate3d(${pct}%, 0px, 0px)`;
+    }
+  };
+  const go = (n) => { idx = (n + slides.length) % slides.length; place(0); };
+  const restart = () => {
+    clearInterval(timer);
+    if (autoMs) timer = setInterval(() => go(idx + 1), autoMs);
+  };
+
+  track.style.cursor = "grab";
+  track.addEventListener("pointerdown", (e) => {
+    dragging = true; startX = e.clientX; dx = 0;
+    track.style.cursor = "grabbing";
+    track.setPointerCapture(e.pointerId);
+    clearInterval(timer);
+  });
+  track.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    dx = e.clientX - startX;
+    place(dx);
+  });
+  const release = () => {
+    if (!dragging) return;
+    dragging = false;
+    track.style.cursor = "grab";
+    const threshold = (track.getBoundingClientRect().width || 1) * 0.2;
+    if (dx <= -threshold) go(idx + 1);
+    else if (dx >= threshold) go(idx - 1);
+    else place(0);
+    restart();
+  };
+  track.addEventListener("pointerup", release);
+  track.addEventListener("pointercancel", release);
+  track.addEventListener("pointerleave", release);
+
+  SLIDER_TIMERS.push(() => clearInterval(timer));
+  place(0);
+  restart();
+}
+
 /* ---------- header / scoreboard ---------- */
 const CLOCK_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" class="sr-lmt-0-minfos-header__icon srm-is-default"><path d="M13.29 9.45a1.55 1.55 0 0 0-2.53 1.79l2.95 4.16a2.29 2.29 0 0 0 3.92 2.03h3.32c.86 0 1.55-.69 1.55-1.55 0-.86-.69-1.55-1.55-1.55h-3.32a2.26 2.26 0 0 0-1.39-.71l-2.95-4.17zM26.89 10.94c.41.88.71 1.83.89 2.81.06.32.35.53.67.51l2.89-.27c.17-.02.33-.1.44-.24a.6.6 0 0 0 .12-.48 15.9 15.9 0 0 0-1.57-4.72.62.62 0 0 0-.42-.32.65.65 0 0 0-.52.12l-2.32 1.84a.62.62 0 0 0-.18.75z"/><path d="M24.73 24.79a.62.62 0 0 0-.76.05 11.86 11.86 0 0 1-6.87 2.96v-1.4a1.03 1.03 0 1 0-2.06 0v1.39A11.92 11.92 0 0 1 4.19 16.95h1.39a1.03 1.03 0 1 0 0-2.06h-1.4A11.93 11.93 0 0 1 14 4.19c.3-.05.51-.31.51-.61V.64a.64.64 0 0 0-.21-.47.65.65 0 0 0-.5-.15 16.06 16.06 0 1 0 13.45 27.4c.13-.13.2-.31.19-.5a.6.6 0 0 0-.27-.46l-2.44-1.67zM18.13 4.19c.41.07.81.16 1.2.27.3.08.61-.06.74-.35l1.18-2.66a.65.65 0 0 0 0-.51.64.64 0 0 0-.38-.34C20.05.34 19.2.14 18.34.02a.61.61 0 0 0-.5.15.6.6 0 0 0-.21.47v2.93a.6.6 0 0 0 .5.62zM24.52 7.54c.22.23.58.25.83.05l2.28-1.81a.6.6 0 0 0 .23-.44.62.62 0 0 0-.17-.47 15.6 15.6 0 0 0-2.75-2.31.63.63 0 0 0-.52-.08.6.6 0 0 0-.39.35l-1.2 2.67a.62.62 0 0 0 .2.75c.54.4 1.03.83 1.49 1.29zM31.82 17.3a.67.67 0 0 0-.5-.19l-2.95.27a.64.64 0 0 0-.56.52 11.63 11.63 0 0 1-1.28 3.69.63.63 0 0 0 .19.81l2.4 1.64c.14.1.32.13.49.09a.64.64 0 0 0 .4-.3 16.13 16.13 0 0 0 1.98-6.03.59.59 0 0 0-.17-.5z"/></svg>';
 
-let VENUE_TIMER = 0;
+const SLIDER_TIMERS = [];
 
 const WEEKDAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
@@ -256,55 +435,38 @@ function renderHeader(feed) {
     titleString((g.venue.location && [g.venue.location.city, g.venue.location.stateAbbrev].filter(Boolean).join(", ")) || ""),
     titleSep());
 
-  /* The venue box is a slider the widget auto-rotates. Slide 1 is the
-     competition/venue line, slide 2 the field facts (surface, capacity,
-     distances) - all of which MLB gives us in venue.fieldInfo. */
+  /* The venue box pages through four single-row slides, matching the widget at
+     this column width: competition/date, venue, ground facts, distances.
+     (The widget also carries wider combined variants tagged srm-hide-small;
+     they are hidden at 400px, so we do not build them.) */
   const fi = g.venue.fieldInfo || {};
   const fieldCol = (title, value) => el("div", "sr-lmt-0-mis-field__col",
     el("div", "sr-lmt-0-mis-field__title sr-lmt-0-mis-field__t-font srm-is-uppercase",
       el("span", null, title)),
     el("div", "sr-lmt-0-mis-field__data sr-lmt-0-mis-field__t-font srm-is-uppercase srm-cap", value));
 
-  /* two groups: five columns do not fit the 400px pane */
+  const rowSlide = (row) => el("div", "sr-lmt-0-mis-venue__slide",
+    el("div", "sr-lmt-0-matchinfoslider__main-title", row));
+  const factSlide = (cols) => el("div", "sr-lmt-0-mis-field__content", ...cols);
+
   const groundCols = [];
   if (fi.turfType) groundCols.push(fieldCol("Surface", fi.turfType));
   if (fi.capacity) groundCols.push(fieldCol("Capacity", fi.capacity));
-  if (fi.roofType) groundCols.push(fieldCol("Roof", fi.roofType));
 
   const distCols = [];
   if (fi.leftLine) distCols.push(fieldCol("LF", `${fi.leftLine} ft`));
   if (fi.center) distCols.push(fieldCol("CF", `${fi.center} ft`));
   if (fi.rightLine) distCols.push(fieldCol("RF", `${fi.rightLine} ft`));
 
-  const slides = [
-    el("div", "sr-lmt-0-mis-venue__wrapper",
-      el("div", "sr-lmt-0-mis-venue__slide",
-        el("div", "sr-lmt-0-matchinfoslider__main-title srm-has-border", compRow),
-        el("div", "sr-lmt-0-matchinfoslider__main-title", venueRow))),
-  ];
-  for (const cols of [groundCols, distCols]) {
-    if (!cols.length) continue;
-    slides.push(el("div", "sr-lmt-0-mis-field__wrapper srm-large",
-      el("div", "sr-lmt-0-matchinfoslider__main-title srm-has-border", compRow.cloneNode(true)),
-      el("div", "sr-slider-flex__slide sr-lmt-0-mis-field__slide sr-lmt-0-mis-slide__slide",
-        el("div", "sr-lmt-0-mis-field__content", ...cols))));
-  }
+  const inners = [rowSlide(compRow), rowSlide(venueRow)];
+  if (groundCols.length) inners.push(factSlide(groundCols));
+  if (distCols.length) inners.push(factSlide(distCols));
 
-  const slideNodes = slides.map((inner) =>
-    el("div", "sr-slider-flex__slide sr-lmt-0-mis-slide__slide", inner));
+  const slideNodes = inners.map((inner) =>
+    el("div", "sr-slider-flex__slide sr-lmt-0-mis-slide__slide srm-show-small", inner));
 
   const sliderTrack = el("div", "sr-slider-flex__slider sr-lmt-0-matchinfoslider__slider", ...slideNodes);
-
-  if (slideNodes.length > 1) {
-    let idx = 0;
-    const show = () => slideNodes.forEach((n) => {
-      n.style.transform = `translate3d(-${idx * 100}%, 0px, 0px)`;
-      n.style.transition = "transform .5s";
-    });
-    show();
-    clearInterval(VENUE_TIMER);
-    VENUE_TIMER = setInterval(() => { idx = (idx + 1) % slideNodes.length; show(); }, 6000);
-  }
+  attachSlider(sliderTrack, slideNodes, 6000);
 
   const slider = el("div", "sr-lmt-0-matchInfosCompHolder__slider-holder",
     el("div", "sr-lmt-0-matchinfoslider__wrapper srt-elevation-2 sr-lmt-3-state__bg", sliderTrack));
@@ -384,20 +546,18 @@ function sliderTitle(title, page, pages, onPrev, onNext) {
   return el("div", "sr-lmt-plus-slider-title__wrap srm-is-uppercase", ...kids);
 }
 
+/* The widget's second statistics slide is exactly four rows, every one of them
+   a batting figure, with the team's season total printed underneath. The
+   labels read oddly ("walks issued", "strikeouts thrown") but they are what
+   happened to this team's batters - verified against the rendered widget. */
 const STAT_ROWS = [
-  ["Hits",          (b, p) => b.hits],
-  ["Runs",          (b, p) => b.runs],
-  ["Doubles",       (b, p) => b.doubles],
-  ["Triples",       (b, p) => b.triples],
-  ["Home runs",     (b, p) => b.homeRuns],
-  ["Strikeouts",    (b, p) => b.strikeOuts],
-  ["Walks issued",  (b, p) => p.baseOnBalls],
-  ["Stolen bases",  (b, p) => b.stolenBases],
-  ["Left on base",  (b, p) => b.leftOnBase],
-  ["Total bases",   (b, p) => b.totalBases],
-  ["RBI",           (b, p) => b.rbi],
+  { label: "Walks issued",      key: "baseOnBalls" },
+  { label: "Stolen bases",      key: "stolenBases" },
+  { label: "Strikeouts thrown", key: "strikeOuts" },
+  { label: "Total bases",       key: "totalBases" },
 ];
 
+/* W-L (or saves) for a decision pitcher, from whichever side he played for. */
 function decisionRecord(feed, personId, type) {
   for (const side of ["away", "home"]) {
     const p = feed.liveData.boxscore.teams[side].players[`ID${personId}`];
@@ -408,22 +568,15 @@ function decisionRecord(feed, personId, type) {
   return "-";
 }
 
-function renderStatistics(feed, state, rerender) {
+function renderStatistics(feed, state, rerender, seasonStats) {
   const bs = feed.liveData.boxscore;
-  const aB = bs.teams.away.teamStats.batting, aP = bs.teams.away.teamStats.pitching;
-  const hB = bs.teams.home.teamStats.batting, hP = bs.teams.home.teamStats.pitching;
-  const aF = bs.teams.away.teamStats.fielding, hF = bs.teams.home.teamStats.fielding;
+  const aB = bs.teams.away.teamStats.batting;
+  const hB = bs.teams.home.teamStats.batting;
 
-  const rows = STAT_ROWS
-    .map(([label, pick]) => {
-      const a = pick(aB, aP), h = pick(hB, hP);
-      return (a === undefined && h === undefined) ? null : horChart(label, a ?? 0, h ?? 0);
-    })
-    .filter(Boolean);
-
-  rows.push(horChart("Errors", aF.errors ?? 0, hF.errors ?? 0));
-  rows.push(horChart("Batting average", aB.avg, hB.avg, undefined, undefined,
-    Number(aB.avg), Number(hB.avg)));
+  const sub = (v) => (v === undefined || v === null ? "" : `(${v})`);
+  const rows = STAT_ROWS.map(({ label, key }) =>
+    horChart(label, aB[key] ?? 0, hB[key] ?? 0,
+      sub(seasonStats.away[key]), sub(seasonStats.home[key])));
 
   /* pitching decisions, the WIN / LOSS / SAVE strip above the bars */
   const dec = feed.liveData.decisions || {};
@@ -458,8 +611,8 @@ function renderStatistics(feed, state, rerender) {
 }
 
 /* ---------- box score tab ---------- */
-const BAT_COLS   = [["AB","atBats"],["R","runs"],["H","hits"],["RBI","rbi"],["BB","baseOnBalls"],["SO","strikeOuts"],["AVG","avg"]];
-const PITCH_COLS = [["IP","inningsPitched"],["H","hits"],["R","runs"],["ER","earnedRuns"],["BB","baseOnBalls"],["SO","strikeOuts"],["ERA","era"]];
+const BAT_COLS   = [["AB","atBats"],["R","runs"],["H","hits"],["RBI","rbi"],["BA","avg"]];
+const PITCH_COLS = [["IP","inningsPitched"],["H","hits"],["ER","earnedRuns"],["BB","baseOnBalls"],["K","strikeOuts"],["ERA","era"]];
 
 function boxTable(headLabel, cols, rows, totals) {
   const thead = el("thead");
@@ -499,6 +652,36 @@ function boxTable(headLabel, cols, rows, totals) {
   return el("table", "sr-table__wrapper sr-lmt-plus-3-box__slide-table", thead, tbody);
 }
 
+/* the widget prints "S. Antonacci"; MLB gives "S Antonacci" in gameData */
+function shortName(feed, id) {
+  const gp = (feed.gameData.players || {})[`ID${id}`] || {};
+  if (gp.firstName && gp.lastName) return `${gp.firstName[0]}. ${gp.lastName}`;
+  if (gp.initLastName) return gp.initLastName.replace(/^(\w)\s/, "$1. ");
+  return gp.fullName || "";
+}
+
+/* The "batting / baserunning" notes the widget prints under each box score.
+   MLB serves them pre-formatted in boxscore.teams[side].info. */
+function boxSummary(info) {
+  const blocks = [];
+  for (const section of (info || [])) {
+    const wrap = el("div", "sr-lmt-plus-3-box-summary__wrapper",
+      el("span", "sr-lmt-plus-3-box-summary__config-name", (section.title || "").toLowerCase()),
+      el("br"));
+    for (const f of (section.fieldList || [])) {
+      const name = el("span", "sr-lmt-plus-3-box-summary__metric-name",
+        el("span", null, el("span", null, (f.label || "").replace(/:$/, ""))));
+      name.appendChild(document.createTextNode(": "));
+      wrap.appendChild(el("div", "sr-lmt-plus-3-box-summary__data-line",
+        name,
+        el("span", "sr-lmt-plus-3-box-summary__metric-data srt-text-tertiary",
+          el("span", null, (f.value || "").replace(/\.$/, "")))));
+    }
+    blocks.push(wrap);
+  }
+  return blocks;
+}
+
 function teamBoxSlide(feed, side) {
   const bs = feed.liveData.boxscore.teams[side];
   const team = feed.gameData.teams[side];
@@ -507,16 +690,16 @@ function teamBoxSlide(feed, side) {
   const batters = bs.batters.map(player).filter(Boolean)
     .filter((p) => p.stats.batting && Object.keys(p.stats.batting).length)
     .map((p) => ({
-      name: p.person.fullName,
+      name: shortName(feed, p.person.id),
       extra: p.position && p.position.abbreviation,
-      /* avg is a season figure; the per-game line does not carry one */
+      /* BA is a season figure; the per-game line does not carry one */
       stats: Object.assign({}, p.stats.batting, { avg: p.seasonStats && p.seasonStats.batting && p.seasonStats.batting.avg }),
     }));
 
   const pitchers = bs.pitchers.map(player).filter(Boolean)
     .filter((p) => p.stats.pitching && Object.keys(p.stats.pitching).length)
     .map((p) => ({
-      name: p.person.fullName,
+      name: shortName(feed, p.person.id),
       extra: "",
       stats: Object.assign({}, p.stats.pitching, { era: p.seasonStats && p.seasonStats.pitching && p.seasonStats.pitching.era }),
     }));
@@ -528,7 +711,8 @@ function teamBoxSlide(feed, side) {
       boxTable("hitters", BAT_COLS, batters, bs.teamStats.batting),
       el("div", "sr-lmt-plus-3-box__team-header srm-is-uppercase",
         el("div", "sr-lmt-plus-3-box__team-name", "Pitchers")),
-      boxTable("pitchers", PITCH_COLS, pitchers, bs.teamStats.pitching)));
+      boxTable("pitchers", PITCH_COLS, pitchers, bs.teamStats.pitching),
+      ...boxSummary(bs.info)));
 }
 
 function renderBoxScore(feed, state, rerender) {
@@ -544,7 +728,8 @@ function renderBoxScore(feed, state, rerender) {
 }
 
 /* ---------- head to head tab ---------- */
-/* sr-lmt-wdl is a W/L form strip (one letter per match), not a score list. */
+/* Three slides, matching the widget: league position / form, hitting leaders,
+   pitching leaders. sr-lmt-wdl is a W/L form strip, one letter per match. */
 function formStrip(results) {
   const wrapper = el("div", "sr-lmt-wdl__wrapper sr-lmt-wdl__wrapper-left");
   for (const r of results) {
@@ -553,69 +738,143 @@ function formStrip(results) {
         el("span", null, r)),
       el("div", "sr-lmt-wdl__vsep", el("div", "sr-lmt-wdl__vsep-line srt-base-1-primary"))));
   }
-  return el("div", "sr-lmt-0-ms-league-position-form__wdls",
-    el("div", "sr-lmt-0-ms-league-position-form__wdls-item", wrapper));
+  return el("div", "sr-lmt-0-ms-league-position-form__wdls-item", wrapper);
 }
 
-function renderH2H(feed, h2h, teamById) {
-  const g = feed.gameData;
-  const awayId = g.teams.away.id, homeId = g.teams.home.id;
+/* The vertical form bar. The widget fills it by translating the inner element
+   up by the percentage, so -60% reads as a 60% full bar. */
+function formChart(pct, isTeam2) {
+  const P = "sr-lmt-0-ms-league-position-form";
+  const container = el("div", "sr-sc-verticalchart__chart-container srt-neutral-10 srm-is-radius");
+  container.style.cssText = "height:100%;width:12px;border-radius:0px;";
+  const inner = el("div", `sr-sc-verticalchart__inner ${isTeam2 ? "srt-home-1" : "srt-away-1"} srm-is-spacing`);
+  inner.style.cssText = `transform: translateY(-${pct}%); border-radius: 0px;`;
+  container.appendChild(inner);
 
-  const games = [];
-  for (const d of (h2h.dates || [])) for (const gm of d.games) {
-    if (gm.status.abstractGameState === "Final") games.push({ date: d.date, gm });
-  }
-  games.sort((a, b) => (a.date < b.date ? 1 : -1));
+  const valueWrap = el("div", `${P}__form-label-value-wrapper` + (isTeam2 ? " srm-is-team2" : ""),
+    el("div", `${P}__form-label-value`, pct),
+    el("div", `${P}__form-label-percent-sign`, "%"));
+  const desc = el("div", `${P}__form-label-description srm-is-uppercase`, el("span", null, "Form"));
+  desc.setAttribute("aria-hidden", "true");
+  const label = el("div", `${P}__form-label ${isTeam2 ? "srt-base-1-home-1" : "srt-base-1-away-1"}`,
+    valueWrap, desc);
 
-  let awayWins = 0, homeWins = 0;
-  const rows = [];
-  const form = [];
-  for (const { date, gm } of games) {
-    const a = gm.teams.away, h = gm.teams.home;
-    const awayIsOurAway = a.team.id === awayId;
-    const ourAwayScore = awayIsOurAway ? a.score : h.score;
-    const ourHomeScore = awayIsOurAway ? h.score : a.score;
-    if (ourAwayScore > ourHomeScore) { awayWins++; form.push("W"); }
-    else if (ourHomeScore > ourAwayScore) { homeWins++; form.push("L"); }
-    else form.push("D");
+  /* team 1 puts the bar first, team 2 the label first */
+  return el("div", `${P}__form-chart` + (isTeam2 ? " srm-is-team2" : ""),
+    ...(isTeam2 ? [label, container] : [container, label]));
+}
 
-    const d = new Date(date + "T12:00:00Z");
-    const abbr = (t) => (teamById[t.id] || {}).abbreviation || t.name;
-    rows.push({
-      name: `${d.getDate()} ${MONTHS[d.getMonth()].slice(0, 3)}`,
-      extra: "",
-      stats: { away: abbr(a.team), score: `${a.score} : ${h.score}`, home: abbr(h.team) },
-    });
-  }
+/* The "Last 10" heading with a record badge per team. */
+function lastTenBoxes(awayRec, homeRec) {
+  const P = "sr-lmt-0-ms-league-position-form";
+  const box = (rec, cls) => el("div", `${P}__last-10-stat ${cls}`,
+    el("span", null, rec ? rec.wins : "-"), txt("-"), el("span", null, rec ? rec.losses : "-"));
+  return el("div", `${P}__last-10-wrapper`,
+    el("div", `${P}__last-10-title srt-text-secondary srm-is-uppercase`, el("span", null, "Last 10")),
+    el("div", `${P}__last-10-boxes`,
+      box(awayRec, "srt-away-1"),
+      el("div", `${P}__last-10-seperator`),
+      box(homeRec, "srt-home-1")));
+}
 
-  const awayName = g.teams.away.teamName || g.teams.away.name;
-  /* __comparison-title is absolutely positioned and would sit on top of the
-     bar label, so section headings use the normal-flow header class instead. */
-  const heading = (t) => el("div", "sr-lmt-plus-3-box__team-header srm-is-uppercase",
-    el("div", "sr-lmt-plus-3-box__team-name", t));
+/* One "29 Murakami vs 31 Crow-Armstrong / home runs" comparison. Element order
+   matters: the title is positioned over the row and must come last. Ties are
+   printed the way the widget does it - the value, then "N Tied". */
+function leaderComparison(label, awayList, homeList) {
+  const side = (list, isRight) => {
+    const mod = isRight ? " srm-is-right" : "";
+    const wrap = el("div", "sr-lmt-plus-3-h2h-leaders__player" + mod);
+    const top = (list || [])[0];
+    if (!top) {
+      wrap.appendChild(el("div", "sr-lmt-plus-3-h2h-leaders__player-name", "-"));
+      return wrap;
+    }
+    const tied = (list || []).filter((x) => x.value === top.value).length;
+    wrap.appendChild(el("div", "sr-lmt-plus-3-h2h-leaders__player-top" + mod,
+      el("div", `sr-lmt-plus-3-h2h-leaders__player-value ${isRight ? "srt-home-1" : "srt-away-1"}`, top.value)));
+    wrap.appendChild(el("div", "sr-lmt-plus-3-h2h-leaders__player-name",
+      tied > 1 ? `${tied} Tied` : lastFirst(top.person.fullName)));
+    return wrap;
+  };
 
-  const block = el("div", "sr-lmt-plus-3-h2h__block",
-    heading("Season series"),
-    horChart("Wins", awayWins, homeWins));
+  const title = el("div", "sr-lmt-plus-3-h2h-leaders__comparison-title srm-is-uppercase",
+    el("span", "sr-lmt-plus-3-h2h-leaders__comparison-title-span", label));
+  title.setAttribute("aria-hidden", "true");
 
-  if (form.length) {
-    block.appendChild(heading(`${awayName} form`));
-    block.appendChild(formStrip(form));
-  }
-  if (rows.length) {
-    block.appendChild(boxTable("meetings",
-      [["Away", "away"], ["Score", "score"], ["Home", "home"]], rows, null));
-  } else {
-    block.appendChild(el("div", "sr-lmt-plus-0-hor-chart__title srt-text-secondary srm-is-uppercase",
-      el("span", null, "No completed meetings this season")));
-  }
+  return el("div", "sr-lmt-plus-3-h2h-leaders__comparison",
+    side(awayList, false), side(homeList, true), title);
+}
+
+/* A slide's own heading, above its rows. */
+function h2hBlock(title, ...rows) {
+  return el("div", "sr-lmt-plus-3-h2h__slide-wrapper",
+    el("div", "sr-lmt-plus-3-h2h__block",
+      el("div", "sr-lmt-plus-3-h2h__block-title srm-is-uppercase",
+        el("span", "sr-lmt-plus-3-h2h__dspan", title)),
+      el("div", "srt-base-1", ...rows)));
+}
+
+/* "Munetaka Murakami" -> "Murakami, Munetaka", as the widget prints it. */
+function lastFirst(full) {
+  const parts = String(full || "").trim().split(" ");
+  if (parts.length < 2) return full || "";
+  return `${parts.slice(1).join(" ")}, ${parts[0]}`;
+}
+
+function renderH2H(data, state, rerender) {
+  const { feed, standings, leaders, form } = data;
+  const ids = [feed.gameData.teams.away.id, feed.gameData.teams.home.id];
+
+  const lastTen = (teamId) => {
+    for (const r of (standings.records || [])) {
+      const t = r.teamRecords.find((x) => x.team.id === teamId);
+      if (!t) continue;
+      const s = ((t.records || {}).splitRecords || []).find((x) => x.type === "lastTen");
+      if (s) return s;
+    }
+    return null;
+  };
+  const a10 = lastTen(ids[0]), h10 = lastTen(ids[1]);
+
+  /* The strip shows the last five results oldest-first, and the Form figure is
+     simply how many of those five were wins. */
+  const lastFive = (arr) => (arr || []).slice(0, 5).reverse();
+  const formPct = (five) => (five.length ? Math.round((five.filter((r) => r === "W").length / five.length) * 100) : 0);
+  const awayFive = lastFive(form.away), homeFive = lastFive(form.home);
+
+  const P = "sr-lmt-0-ms-league-position-form";
+  const positionSlide = el("div", "sr-lmt-plus-3-h2h__slide-wrapper",
+    el("div", "sr-lmt-plus-3-h2h__block",
+      el("div", `${P}__wrapper`,
+        el("div", `${P}__container`,
+          el("div", `${P}__chart-wrapper srm-padding-top`,
+            formChart(formPct(awayFive), false),
+            lastTenBoxes(a10, h10),
+            formChart(formPct(homeFive), true)))),
+      el("div", `${P}__wdls`,
+        formStrip(awayFive),
+        formStrip(homeFive))));
+
+  const hittingSlide = h2hBlock("Hitting leaders",
+      leaderComparison("home runs", leaders.away.homeRuns, leaders.home.homeRuns),
+      leaderComparison("batting average", leaders.away.battingAverage, leaders.home.battingAverage),
+      leaderComparison("RBI", leaders.away.runsBattedIn, leaders.home.runsBattedIn));
+
+  const pitchingSlide = h2hBlock("Pitching leaders",
+      leaderComparison("ERA", leaders.away.earnedRunAverage, leaders.home.earnedRunAverage),
+      leaderComparison("Wins", leaders.away.wins, leaders.home.wins),
+      leaderComparison("strikeouts", leaders.away.strikeouts, leaders.home.strikeouts));
+
+  const slides = [positionSlide, hittingSlide, pitchingSlide];
+  const page = Math.min(state.h2hPage || 0, slides.length - 1);
 
   return panelShell("sr-lmt-plus-3-h2h", "lmt-plus-3-h2h",
     el("div", "sr-lmt-plus-3-h2h__wrapper srt-base-1",
       el("div", "sr-lmt-plus-slider__wrapper",
-        sliderTitle("head to head", 0, 1),
-        sliderBody("sr-lmt-plus-3-h2h",
-          scrollbars(null, el("div", "sr-lmt-plus-3-h2h__slide-wrapper", block))))));
+        sliderTitle("Head to head", page, slides.length,
+          () => { state.h2hPage = page - 1; rerender(); },
+          () => { state.h2hPage = page + 1; rerender(); }),
+        sliderBody("sr-lmt-plus-3-h2h", scrollbars(null, slides[page])))));
 }
 
 /* ---------- standings tab ---------- */
@@ -625,7 +884,6 @@ const STANDINGS_COLS = [
   { label: "W",   w: "srm-w30", get: (t) => t.wins },
   { label: "L",   w: "srm-w30", get: (t) => t.losses },
   { label: "%",   w: "srm-w40", get: (t) => t.winningPercentage },
-  { label: "GB",  w: "srm-w40", get: (t) => t.gamesBack },
   { label: "L10", w: "srm-w40", get: (t) => {
       const r = ((t.records || {}).splitRecords || []).find((x) => x.type === "lastTen");
       return r ? `${r.wins}-${r.losses}` : "-";
@@ -636,6 +894,10 @@ const DIVISION_NAMES = {
   200: "American League West", 201: "American League East", 202: "American League Central",
   203: "National League West", 204: "National League East", 205: "National League Central",
 };
+const LEAGUE_NAMES = { 103: "American League", 104: "National League" };
+/* AL divisions (Central, East, West) then NL, then the two league tables -
+   the order the widget lists them in. */
+const DIVISION_ORDER = [202, 201, 200, 205, 204, 203];
 
 function standingsTable(record, highlightIds, teamById, season) {
   const headCell = (label, extra, idx) => {
@@ -668,32 +930,45 @@ function standingsTable(record, highlightIds, teamById, season) {
     tbody.appendChild(tr);
   }
 
-  const name = DIVISION_NAMES[record.division && record.division.id] || "Standings";
+  const name = record.leagueWide
+    ? (LEAGUE_NAMES[record.league && record.league.id] || "League")
+    : (DIVISION_NAMES[record.division && record.division.id] || "Standings");
 
   return el("div", "sr-lmt-plus-livetable__table-holder",
     el("div", "sr-lmt-plus-livetable__league-name srm-is-uppercase", el("span", null, `MLB ${season}, ${name}`)),
     el("table", "sr-lmt-plus-livetable__table", tbody));
 }
 
-function renderStandings(feed, standings, teamById) {
+function renderStandings(feed, standings, teamById, byLeague) {
   const season = feed.gameData.game.season;
   const ids = [feed.gameData.teams.away.id, feed.gameData.teams.home.id];
-  const relevant = (standings.records || []).filter((r) =>
-    r.teamRecords.some((t) => ids.includes(t.team.id)));
-  const use = relevant.length ? relevant : (standings.records || []).slice(0, 2);
+
+  const divisions = (standings.records || []).slice().sort((a, b) =>
+    DIVISION_ORDER.indexOf((a.division || {}).id) - DIVISION_ORDER.indexOf((b.division || {}).id));
+
+  const leagues = ((byLeague || {}).records || []).map((r) =>
+    Object.assign({}, r, { leagueWide: true }));
+
+  const tables = [...divisions, ...leagues];
 
   return panelShell("sr-lmt-plus-livetable", "livetable",
     el("div", "sr-lmt-plus-livetable__container srt-base-1",
       el("div", "sr-lmt-plus-slider__wrapper",
-        sliderTitle("standings", 0, 1),
-        sliderBody("sr-lmt-plus-livetable", scrollbars(null, ...use.map((r) => standingsTable(r, ids, teamById, season)))))));
+        sliderTitle("Standings", 0, 1),
+        sliderBody("sr-lmt-plus-livetable",
+          scrollbars(null, ...tables.map((r) => standingsTable(r, ids, teamById, season)))))));
 }
 
 /* ---------- timeline tab ---------- */
+const ORDINALS = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th"];
+const ordinal = (n) => ORDINALS[n] || `${n}th`;
+
 function renderTimeline(feed) {
   const plays = feed.liveData.plays.allPlays || [];
   const g = feed.gameData;
   const abbr = { away: g.teams.away.abbreviation, home: g.teams.home.abbreviation };
+  const nick = { away: g.teams.away.teamName || g.teams.away.name,
+                 home: g.teams.home.teamName || g.teams.home.name };
 
   /* group into inning halves, newest first, the way the widget stacks them */
   const halves = [];
@@ -710,50 +985,77 @@ function renderTimeline(feed) {
 
   const frames = halves.map((h) => {
     const side = h.half === "top" ? "away" : "home";
-    const header = el("div", "sr-lmt-plus-3-pbp-row__inning-half-header srt-text-secondary",
-      el("div", "sr-lmt-plus-3-pbp-row__inning-detail srm-is-uppercase",
-        `${h.half === "top" ? "Top" : "Bottom"} ${h.inning}`),
-      el("div", "sr-lmt-plus-3-pbp-row__team-abbr", abbr[side]));
+    const last = h.plays[h.plays.length - 1];
+    const away = last && last.result ? last.result.awayScore : 0;
+    const home = last && last.result ? last.result.homeScore : 0;
 
-    const events = h.plays.filter((p) => p.result && p.result.description).map((p) => {
-      const scored = (p.about.isScoringPlay);
-      return el("div", "sr-lmt-plus-3-pbp-row__event",
-        el("div", "sr-lmt-plus-3-pbp-row__data-row",
-          el("div", "sr-lmt-plus-3-pbp-row__data-top",
-            el("div", "sr-lmt-plus-3-pbp-row__abbr-and-type",
-              el("span", "sr-lmt-plus-3-pbp-row__play-type" + (scored ? " srt-base-1-primary srm-is-bold" : " srt-text-secondary"),
-                p.result.event || ""),
-              scored ? el("span", "sr-lmt-plus-3-pbp-row__team-abbr srm-is-bold",
-                ` ${p.result.awayScore} : ${p.result.homeScore}`) : null)),
-          el("div", "sr-lmt-plus-3-pbp-row__text", p.result.description)));
-    });
+    /* "Bot 10th" on the left, the score at the end of the half on the right */
+    const header = el("div", "sr-lmt-plus-3-pbp-row__inning-half-header srt-text-secondary",
+      el("div", "sr-lmt-plus-3-pbp-row__inning-detail",
+        el("span", "sr-lmt-plus-3-pbp-row__frame", h.half === "top" ? "Top" : "Bot"),
+        txt(" " + ordinal(h.inning))),
+      el("div", null,
+        el("span", null, away), el("span", null, " - "), el("span", null, home)));
+
+    const body = el("div", null,
+      el("div", "sr-lmt-plus-3-pbp-row__data-row sr-lmt-plus-3-pbp-row__full-team-name", nick[side]));
+
+    for (const p of h.plays) {
+      if (!p.result || !p.result.description) continue;
+      const scored = p.about.isScoringPlay;
+
+      const top = el("div", "sr-lmt-plus-3-pbp-row__data-top",
+        el("div", "sr-lmt-plus-3-pbp-row__abbr-and-type",
+          el("div", "sr-lmt-plus-3-pbp-row__team-abbr", abbr[side]),
+          el("div", "sr-lmt-plus-3-pbp-row__play-type" + (scored ? " srt-primary-1" : ""),
+            el("span", null, p.result.event || ""))));
+
+      if (scored) {
+        top.appendChild(el("div", "sr-lmt-plus-3-pbp-elements__at-bat-1-result srt-primary-1",
+          el("div", null,
+            el("span", "sr-lmt-plus-3-pbp-elements", p.result.awayScore),
+            el("span", null, " - "),
+            el("span", "sr-lmt-plus-3-pbp-elements__result-bold", p.result.homeScore))));
+      }
+
+      body.appendChild(el("div", "sr-lmt-plus-3-pbp-row__data-row",
+        top,
+        el("div", null, p.result.description)));
+    }
+
+    const section = el("section", "sr-collapse__children", body);
+    section.style.maxHeight = "none";
 
     return el("div", "sr-lmt-plus-3-pbp-row__frame",
       el("div", "sr-collapse__wrapper sr-lmt-plus-3-pbp-row__inning-half srm-no-border",
-        header, ...events));
+        header, section));
   });
 
   const content = frames.length ? frames
     : [el("div", "sr-lmt-plus-0-hor-chart__title srt-text-secondary srm-is-uppercase",
         el("span", null, "No plays yet"))];
+
   /* the timeline is a plain scroller, not a slider */
   return panelShell("sr-lmt-plus-3-pbp-row", null,
     el("div", "sr-lmt-plus-3-pbp-row__wrapper srt-base-1",
-      sliderTitle("timeline", 0, 1),
+      sliderTitle("Timeline", 0, 1),
       scrollbars("sr-lmt-plus-3-pbp-row__scroller-wrapper",
         el("div", "sr-lmt-plus-3-pbp-row__scroller-inner", ...content))));
 }
 
 /* ---------- shell ---------- */
 const PANELS = {
-  statistics: (d, s, r) => renderStatistics(d.feed, s, r),
+  statistics: (d, s, r) => renderStatistics(d.feed, s, r, d.season),
   boxScore:   (d, s, r) => renderBoxScore(d.feed, s, r),
-  headToHead: (d, s, r) => renderH2H(d.feed, d.h2h, d.teamById),
-  standings:  (d, s, r) => renderStandings(d.feed, d.standings, d.teamById),
+  headToHead: (d, s, r) => renderH2H(d, s, r),
+  standings:  (d, s, r) => renderStandings(d.feed, d.standings, d.teamById, d.byLeague),
   timeline:   (d, s, r) => renderTimeline(d.feed),
 };
 
 function renderWidget(data, state) {
+  /* the previous render's slider intervals would otherwise keep firing */
+  while (SLIDER_TIMERS.length) SLIDER_TIMERS.pop()();
+
   const root = document.querySelector(".sr-widget");
   const rerender = () => renderWidget(data, state);
 
@@ -774,12 +1076,16 @@ function renderWidget(data, state) {
       el("div", "sr-lmt-plus__comp-wrap srm-double",
         el("div", "sr-lmt-plus__comp-size", pitchRoot))));
 
+  const panel = tabReady(data, state.tab)
+    ? PANELS[state.tab](data, state, rerender)
+    : loadingPanel(TAB_LABELS[state.tab]);
+
   const panelCol = el("div", "sr-lmt-plus__comp srm-double srm-notLmt",
     el("div", "sr-lmt-plus__comp-padding",
       el("div", "sr-lmt-plus__comp-wrap srm-double",
-        el("div", "sr-lmt-plus__comp-size", PANELS[state.tab](data, state, rerender)))));
+        el("div", "sr-lmt-plus__comp-size", panel))));
 
-  const tabs = renderTabs(state.tab, (t) => { state.tab = t; renderWidget(data, state); });
+  const tabs = renderTabs(state.tab, (t) => { selectTab(data, state, t); });
   const tabsNode = tabs.querySelector(".sr-lmt-plus-tabs");
   if (tabsNode) responsive(tabsNode, "lmt-plus-tabs");
 
@@ -796,6 +1102,17 @@ function renderWidget(data, state) {
   root.replaceChildren(widget);
 }
 
+/* Switch tabs at once, painting the spinner, then re-render when the tab's
+   data resolves - the same order the real widget does it in. */
+function selectTab(data, state, tab) {
+  state.tab = tab;
+  const pending = ensureTabData(data, tab);
+  renderWidget(data, state);
+  if (pending) pending.then(() => {
+    if (state.tab === tab) renderWidget(data, state);
+  });
+}
+
 function renderError(err) {
   const root = document.querySelector(".sr-widget");
   root.replaceChildren(el("div", "sr-bb sr-lmt-plus sr-ltr",
@@ -804,23 +1121,219 @@ function renderError(err) {
       el("div", "sr-lmt-0-minfos-header__c-text srt-text-secondary srm-is-subtitle", String(err && err.message || err)))));
 }
 
-async function main() {
-  const state = { tab: "statistics", boxPage: 0 };
-  const gamePk = Number(new URLSearchParams(location.search).get("game")) || GAME_PK;
+/* ---------- routing ----------
+   The id can come from the path (/824639, mirroring the tracker URL shape) or
+   from ?game=. Note this is an MLB gamePk, not a Sportradar match id - the two
+   are different id spaces and there is no public mapping between them. */
+function gamePkFromLocation() {
+  const fromPath = location.pathname.match(/(\d{4,})/);
+  if (fromPath) return Number(fromPath[1]);
+  const q = new URLSearchParams(location.search).get("game");
+  if (q && /^\d+$/.test(q)) return Number(q);
+  return GAME_PK;
+}
+
+let CURRENT = null;
+
+async function show(gamePk, { push } = {}) {
+  const state = { tab: "statistics", boxPage: 0, statsPage: 0, h2hPage: 0 };
+  CURRENT = gamePk;
+  setPickerValue(gamePk);
+  setPickerMessage("");
+  markCurrentGame();
+
   try {
-    const data = await loadAll(gamePk);
-    renderWidget(data, state);
+    const data = await loadFeed(gamePk);
+    if (CURRENT !== gamePk) return;          // a newer request won
+    selectTab(data, state, state.tab);
+    document.title = matchTitle(data.feed);
+
+    /* first load: list the day this game belongs to */
+    if (!panelDate) renderGames(data.feed.gameData.datetime.originalDate
+      || isoDate(new Date(data.feed.gameData.datetime.dateTime)));
+    else markCurrentGame();
+
+    if (push) history.pushState({ gamePk }, "", `/${gamePk}`);
+
     if (data.feed.gameData.status.abstractGameState === "Live") {
       setInterval(async () => {
+        if (CURRENT !== gamePk) return;
         try {
-          const fresh = await loadAll(gamePk);
-          renderWidget(fresh, state);
+          /* refresh the match feed only; cached tab data stays put */
+          data.feed = await getJSON(`${API}/v1.1/game/${gamePk}/feed/live`);
+          renderWidget(data, state);
         } catch (e) { /* keep the last good render */ }
       }, REFRESH_MS);
     }
   } catch (e) {
-    renderError(e);
+    renderError(new Error(`No MLB game found for id ${gamePk}`));
+    const complain = () =>
+      setPickerMessage(`No MLB game with id ${gamePk}. Pick one from the list below.`, true);
+    /* renderGames clears the message on success, so complain after it settles */
+    if (!panelDate) renderGames(isoDate(new Date())).then(complain, complain);
+    else complain();
   }
+}
+
+function matchTitle(feed) {
+  const t = feed.gameData.teams;
+  return `${t.away.abbreviation} @ ${t.home.abbreviation} - Live Match Tracker`;
+}
+
+/* ---------- games panel ---------- */
+const PLAY_ICON = '<svg viewBox="0 0 8 10" aria-hidden="true"><path d="M0 0l8 5-8 5z"/></svg>';
+const DAY_MS = 86400000;
+
+let panelDate = null;      // the day currently listed
+let teamDir = null;        // id -> team, for abbreviations
+
+const isoDate = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+function setPickerValue(gamePk) {
+  const input = document.getElementById("gameId");
+  if (input && document.activeElement !== input) input.value = gamePk;
+}
+
+function setPickerMessage(msg, isError) {
+  const box = document.getElementById("gamesMsg");
+  if (!box) return;
+  box.textContent = msg || "";
+  box.classList.toggle("is-error", Boolean(isError));
+}
+
+async function teamDirectory(season) {
+  if (teamDir) return teamDir;
+  teamDir = {};
+  try {
+    const d = await getJSON(`${API}/v1/teams?sportId=1&season=${season}`);
+    for (const t of (d.teams || [])) teamDir[t.id] = t;
+  } catch (e) { /* fall back to full names */ }
+  return teamDir;
+}
+
+const abbrOf = (team) => (teamDir && teamDir[team.id] && teamDir[team.id].abbreviation) || team.name;
+
+/* "7:10 PM" in the viewer's own timezone. */
+const startTime = (iso) =>
+  new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+function gameRow(g) {
+  const li = el("li", "games__row");
+  li.dataset.gamePk = g.gamePk;
+  if (g.gamePk === CURRENT) li.classList.add("is-current");
+
+  const play = el("button", "games__play");
+  play.type = "button";
+  play.title = "Open this game";
+  play.innerHTML = PLAY_ICON;
+
+  const state = g.status.abstractGameState;
+  const teams = el("div", "games__teams",
+    el("span", "games__abbr", abbrOf(g.teams.away.team)),
+    el("span", "games__at", "@"),
+    el("span", "games__abbr", abbrOf(g.teams.home.team)));
+
+  if (state !== "Preview") {
+    teams.appendChild(el("span", "games__score",
+      `${g.teams.away.score ?? 0} : ${g.teams.home.score ?? 0}`));
+  }
+
+  const label = state === "Preview" ? startTime(g.gameDate)
+    : state === "Live" ? (g.status.detailedState || "Live")
+    : (g.status.detailedState || "Final");
+  const stateEl = el("div", "games__state" + (state === "Live" ? " is-live" : ""), label);
+
+  li.appendChild(play);
+  li.appendChild(teams);
+  li.appendChild(stateEl);
+  li.addEventListener("click", () => {
+    if (g.gamePk !== CURRENT) show(g.gamePk, { push: true });
+  });
+  return li;
+}
+
+async function renderGames(date) {
+  panelDate = date;
+  const list = document.getElementById("gamesList");
+  const label = document.getElementById("gamesDate");
+  if (!list) return;
+
+  const d = new Date(`${date}T12:00:00`);
+  if (label) label.textContent = d.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+
+  list.replaceChildren();
+  setPickerMessage("Loading games…");
+  try {
+    const sched = await getJSON(`${API}/v1/schedule?sportId=1&date=${date}`);
+    if (panelDate !== date) return;            // a newer day won
+    const games = ((sched.dates || [])[0] || {}).games || [];
+    await teamDirectory(d.getFullYear());
+    if (panelDate !== date) return;
+
+    setPickerMessage("");
+    if (!games.length) {
+      list.appendChild(el("li", "games__empty", "No MLB games on this date."));
+      return;
+    }
+    games.sort((a, b) => (a.gameDate < b.gameDate ? -1 : 1));
+    for (const g of games) list.appendChild(gameRow(g));
+
+    /* bring the game being shown into view rather than making them hunt */
+    const current = list.querySelector(".games__row.is-current");
+    if (current) current.scrollIntoView({ block: "center" });
+  } catch (e) {
+    setPickerMessage("Could not load the schedule for this date.", true);
+  }
+}
+
+/* Keep the highlight in step with whatever the widget is showing. */
+function markCurrentGame() {
+  let current = null;
+  for (const row of document.querySelectorAll(".games__row")) {
+    const on = Number(row.dataset.gamePk) === CURRENT;
+    row.classList.toggle("is-current", on);
+    if (on) current = row;
+  }
+  if (current) current.scrollIntoView({ block: "center" });
+}
+
+function shiftDay(days) {
+  const d = new Date(`${panelDate}T12:00:00`);
+  d.setTime(d.getTime() + days * DAY_MS);
+  renderGames(isoDate(d));
+}
+
+function wirePicker() {
+  const byId = (id) => document.getElementById(id);
+  const prev = byId("prevDay"), next = byId("nextDay"), today = byId("todayBtn");
+  const load = byId("loadId"), input = byId("gameId");
+
+  if (prev) prev.addEventListener("click", () => shiftDay(-1));
+  if (next) next.addEventListener("click", () => shiftDay(1));
+  if (today) today.addEventListener("click", () => renderGames(isoDate(new Date())));
+
+  const submitId = () => {
+    /* tolerate a pasted URL as well as a bare id */
+    const m = (input.value || "").trim().match(/(\d{4,})/);
+    if (!m) { setPickerMessage("Enter a numeric game id.", true); return; }
+    const pk = Number(m[1]);
+    if (pk !== CURRENT) show(pk, { push: true });
+  };
+  if (load) load.addEventListener("click", submitId);
+  if (input) input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submitId(); }
+  });
+}
+
+window.addEventListener("popstate", () => {
+  const pk = gamePkFromLocation();
+  if (pk !== CURRENT) show(pk);
+});
+
+function main() {
+  wirePicker();
+  show(gamePkFromLocation());
 }
 
 main();

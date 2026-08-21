@@ -9,10 +9,12 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
 
+<!-- Absolute paths, not "./" - the page is also served from /<gameId>, where
+     relative URLs would resolve against the wrong base. -->
 <!-- Sportradar LMT layout stylesheets, vendored locally (see vendor/README.md) -->
-<link rel="stylesheet" href="./vendor/sr-layout.css">
+<link rel="stylesheet" href="/vendor/sr-layout.css">
 <!-- Your colour tokens. Unchanged. -->
-<link rel="stylesheet" href="./theme.css">
+<link rel="stylesheet" href="/theme.css">
 
 <style>
   body {
@@ -20,15 +22,107 @@
     background: #0f1115;
     font: 15px system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   }
-  .sr-widget { width: 100vw; max-width: 800px; }
+  .page { width: 100vw; max-width: 800px; }
+  .sr-widget { width: 100%; }
+
+  /* The vendored loader rule sizes and animates the spinner dots but leaves
+     them unpainted; the theme token supplies the colour. */
+  .sr-loader-dots__dot { background: currentColor; }
+
+  /* Games panel. Not part of the widget - its own thing, but built from the
+     theme's tokens so it reads as the same product. */
+  .games {
+    margin-top: 14px; background: #222; border-radius: 3px;
+    color: #FBF7F7; font: 13px "Roboto", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .games__bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; border-bottom: 1px solid rgba(251,247,247,.08);
+  }
+  .games__title {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: rgba(251,247,247,.5);
+  }
+  .games__date { font-weight: 700; min-width: 148px; text-align: center; }
+  .games__nav {
+    background: none; border: 1px solid rgba(251,247,247,.18); color: #FBF7F7;
+    width: 26px; height: 26px; border-radius: 3px; cursor: pointer;
+    font: 14px/1 "Roboto", sans-serif; display: grid; place-items: center;
+  }
+  .games__nav:hover { border-color: #9AE200; color: #9AE200; }
+  .games__spacer { flex: 1; }
+  .games__id {
+    width: 128px; background: #0f1115; color: #FBF7F7;
+    border: 1px solid rgba(251,247,247,.18); border-radius: 3px;
+    padding: 6px 8px; font: inherit;
+  }
+  .games__id:focus { outline: none; border-color: #9AE200; }
+  .games__go {
+    background: none; border: 1px solid rgba(251,247,247,.18); color: rgba(251,247,247,.75);
+    border-radius: 3px; padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  .games__go:hover { border-color: #9AE200; color: #9AE200; }
+
+  .games__list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+  .games__row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 12px; border-bottom: 1px solid rgba(251,247,247,.05);
+    cursor: pointer;
+  }
+  .games__row:last-child { border-bottom: 0; }
+  .games__row:hover { background: rgba(154,226,0,.07); }
+  .games__row.is-current { background: rgba(154,226,0,.12); }
+
+  .games__play {
+    flex: none; width: 26px; height: 26px; border-radius: 50%;
+    border: 1px solid rgba(154,226,0,.5); background: none; color: #9AE200;
+    display: grid; place-items: center; cursor: pointer; padding: 0;
+  }
+  .games__row:hover .games__play { background: #9AE200; color: #14180c; border-color: #9AE200; }
+  .games__row.is-current .games__play { background: #9AE200; color: #14180c; border-color: #9AE200; }
+  .games__play svg { width: 9px; height: 11px; fill: currentColor; }
+
+  .games__teams { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; }
+  .games__abbr { font-weight: 700; letter-spacing: .02em; }
+  .games__at { color: rgba(251,247,247,.35); font-size: 11px; }
+  .games__score { font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .04em; }
+  .games__state {
+    flex: none; min-width: 88px; text-align: right;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    color: rgba(251,247,247,.45);
+  }
+  .games__state.is-live { color: #9AE200; }
+  .games__empty, .games__msg {
+    padding: 14px 12px; color: rgba(251,247,247,.45); font-size: 12px;
+  }
+  .games__msg.is-error { color: #ff8a8a; }
+  .games__msg:empty { display: none; }
 </style>
 </head>
 <body>
 
-<div class="sr-widget"></div>
+<div class="page">
+  <div class="sr-widget"></div>
 
-<script src="./vendor/sr-pitch.js"></script>
-<script src="./app.js"></script>
+  <section class="games" id="games">
+    <div class="games__bar">
+      <span class="games__title">Games</span>
+      <button class="games__nav" id="prevDay" type="button" title="Previous day">&#8249;</button>
+      <span class="games__date" id="gamesDate">&nbsp;</span>
+      <button class="games__nav" id="nextDay" type="button" title="Next day">&#8250;</button>
+      <button class="games__go" id="todayBtn" type="button">Today</button>
+      <span class="games__spacer"></span>
+      <input class="games__id" id="gameId" inputmode="numeric" autocomplete="off" placeholder="gamePk" />
+      <button class="games__go" id="loadId" type="button">Load</button>
+    </div>
+    <div class="games__msg" id="gamesMsg"></div>
+    <ul class="games__list" id="gamesList"></ul>
+  </section>
+</div>
+
+<script src="/vendor/sr-pitch.js"></script>
+<script src="/app.js"></script>
 
 </body>
 </html>
